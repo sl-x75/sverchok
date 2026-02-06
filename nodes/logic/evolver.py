@@ -365,13 +365,17 @@ class DNA:
                 gen_data.set_node_with_gene(tree, agent_gene)
 
             tree.sv_process = True
-            for node in exec_order:
+            for n_exec in exec_order:
                 try:
-                    s_tree.update_node(node, suppress=False)
+                    s_tree.update_node(n_exec, suppress=False)
                 except Exception:
                     raise
 
-            agent_fitness = node.inputs[0].sv_get(deepcopy=False)[0]
+            fitness_data = node.inputs[0].sv_get(deepcopy=False)
+            if not fitness_data:
+                agent_fitness = 0.0 
+            else:
+                agent_fitness = fitness_data[0]
             if isinstance(agent_fitness, list):
                 agent_fitness = agent_fitness[0]
             self.fitness = agent_fitness
@@ -715,13 +719,13 @@ class SvEvolverNode(SverchCustomTreeNode, bpy.types.Node):
             goal_row.prop(self, "fitness_goal")
         else:
             layout.prop(self, "use_fitness_goal")
-        if self.node_id in evolver_mem:
+        if self.n_id and self.n_id in evolver_mem:
             layout.prop(self, "reuse_population")
         row = layout.row(align=True)
         row.scale_y = 2
         self.wrapper_tracked_ui_draw_op(row, "node.evolver_run", icon='RNA', text="RUN")
-        if self.node_id in evolver_mem:
-            self.wrapper_tracked_ui_draw_op(layout, "node.evolver_set_fittest", icon='RNA_ADD', text="Set Fittest")
+        if self.n_id and self.n_id in evolver_mem:
+            self.wrapper_tracked_ui_draw_op(layout, "node.evolver_set_fittest", icon='ADD', text="Set Fittest")
             layout.prop(self, "output_all")
 
     def has_been_runned(self):
