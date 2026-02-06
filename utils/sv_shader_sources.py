@@ -11,7 +11,8 @@
 
 
 dashed_vertex_shader = '''
-    layout (location = 0) in vec3 inPos;
+    #version 330 core
+    in vec3 inPos;
 
     flat out vec3 startPos;
     out vec3 vertPos;
@@ -28,6 +29,7 @@ dashed_vertex_shader = '''
 '''
 
 dashed_fragment_shader = '''
+    #version 330 core
     flat in vec3 startPos;
     in vec3 vertPos;
 

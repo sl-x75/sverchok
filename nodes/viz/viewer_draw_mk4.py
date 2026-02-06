@@ -206,15 +206,17 @@ def view_3d_geom(context, args):
 
         if config.draw_dashed:
             shader = config.dashed_shader
-            batch = batch_for_shader(shader, 'LINES', {"inPos" : geom.e_vertices}, indices=geom.e_indices)
-            shader.bind()
-            matrix = context.region_data.perspective_matrix
-            shader.uniform_float("u_mvp", matrix)
-            shader.uniform_float("u_resolution", config.u_resolution)
-            shader.uniform_float("u_dashSize", config.u_dash_size)
-            shader.uniform_float("u_gapSize", config.u_gap_size)
-            shader.uniform_float("m_color", geom.e_vertex_colors[0])
-            batch.draw(shader)
+            # Check if shader creation failed (shouldn't happen with our robust add_dashed_shader, but safe to check)
+            if shader:
+                batch = batch_for_shader(shader, 'LINES', {"inPos" : geom.e_vertices}, indices=geom.e_indices)
+                shader.bind()
+                matrix = context.region_data.perspective_matrix
+                shader.uniform_float("u_mvp", matrix)
+                shader.uniform_float("u_resolution", config.u_resolution)
+                shader.uniform_float("u_dashSize", config.u_dash_size)
+                shader.uniform_float("u_gapSize", config.u_gap_size)
+                shader.uniform_float("m_color", geom.e_vertex_colors[0])
+                batch.draw(shader)
         else:
             if bpy.app.version < (4, 5, 0):
                 depthBias = 3e-5 # ~1e-6..1e-4
@@ -470,12 +472,8 @@ def polygons_geom(config, vecs, polygons, p_vertices, p_vertex_colors, p_indices
     '''generates polygons geometry'''
 
     if (config.color_per_polygon and not config.polygon_use_vertex_color) or config.shade_mode == 'facet':
-        if config.all_triangles:
-            polygon_indices = polygons
-            original_idx = list(range(len(polygons)))
-        else:
-            polygon_indices, original_idx = ensure_triangles(vecs, polygons, config.handle_concave_quads)
-
+        # Always triangulate for batch_for_shader 'TRIS' mode
+        polygon_indices, original_idx = ensure_triangles(vecs, polygons, config.handle_concave_quads)
 
         if config.shade_mode == 'facet':
             light_factor = face_light_factor(vecs, polygons, config.vector_light)
@@ -497,11 +495,8 @@ def polygons_geom(config, vecs, polygons, p_vertices, p_vertex_colors, p_indices
         p_vertex_colors.extend(v_c)
         p_indices.extend(idx)
     else:
-        if config.all_triangles:
-            polygon_indices = polygons
-            original_idx = list(range(len(polygons)))
-        else:
-            polygon_indices, original_idx = ensure_triangles(vecs, polygons, config.handle_concave_quads)
+        # Always triangulate for batch_for_shader 'TRIS' mode
+        polygon_indices, original_idx = ensure_triangles(vecs, polygons, config.handle_concave_quads)
         p_vertices.extend(v_path)
 
         if config.shade_mode == 'smooth':
@@ -509,7 +504,12 @@ def polygons_geom(config, vecs, polygons, p_vertices, p_vertex_colors, p_indices
             light_factor = vert_light_factor(vecs, polygons, config.vector_light)
             colors = []
             if config.polygon_use_vertex_color:
-                for l_factor, col in zip(light_factor, points_colors):
+                # Robust loop to ensure colors match light_factor (vertices) length
+                for i, l_factor in enumerate(light_factor):
+                    if i < len(points_colors):
+                        col = points_colors[i]
+                    else:
+                        col = [1.0, 1.0, 1.0, 1.0] # Fallback color
                     colors.append([col[0]*l_factor, col[1]*l_factor, col[2]*l_factor, col[3]])
             else:
                 col = p_cols
@@ -601,6 +601,8 @@ def generate_mesh_geom(config, vecs_in):
     else:
         points_color = []
 
+    points_color_offset = 0
+
     for vecs, mat, polygons, edges, p_cols, e_col in zip(vecs_in, mats_in, cycle(polygons_s), cycle(edges_s), cycle(pol_color), cycle(edge_color)):
         if use_matrix:
             v_path = [(mat @ Vector(v))[:] for v in vecs]
@@ -610,11 +612,17 @@ def generate_mesh_geom(config, vecs_in):
         if config.draw_edges:
             edges_geom(config, edges, e_col, v_path, e_vertices, e_vertex_colors, e_indices, idx_e_offset)
         if config.draw_polys:
-            polygons_geom(config, vecs, polygons, p_vertices, p_vertex_colors, p_indices, v_path, p_cols, idx_p_offset, points_color)
+            current_points_color = points_color[points_color_offset:points_color_offset + len(vecs)]
+            polygons_geom(config, vecs, polygons, p_vertices, p_vertex_colors, p_indices, v_path, p_cols, idx_p_offset, current_points_color)
+        
+        points_color_offset += len(vecs)
 
     if config.draw_verts:
         if config.uniform_verts:
-            config.v_shader = gpu.shader.from_builtin(shading_3d.UNIFORM_COLOR)
+            try:
+                config.v_shader = gpu.shader.from_builtin('POINT_UNIFORM_COLOR')
+            except Exception:
+                config.v_shader = gpu.shader.from_builtin(shading_3d.UNIFORM_COLOR)
         else:
             config.v_shader = gpu.shader.from_builtin(shading_3d.SMOOTH_COLOR)
         geom.v_vertices, geom.points_color = v_vertices, points_color
@@ -667,6 +675,73 @@ def get_shader_data(named_shader=None):
     return [local_vars.get(name) for name in names]
 
 def add_dashed_shader(config):
+    if bpy.app.version >= (4, 0, 0):
+        try:
+            import gpu
+            shader_info = gpu.types.GPUShaderCreateInfo()
+            shader_info.vertex_in(0, 'VEC3', "inPos")
+            shader_info.vertex_out(gpu.types.GPUStageInterfaceInfo("my_interface"))
+            
+            # Re-declare interface for clarity (though CreateInfo handles linking usually, 
+            # we need to ensure the names match the source if we use source strings).
+            # But with CreateInfo, we typically use .vertex_source and .fragment_source 
+            # which are composed.
+            
+            # Using the exact source from sv_shader_sources might be tricky if we don't 
+            # use gpu.types.GPUShader(v, f).
+            # However, for 4.0+, direct GPUShader(v, f) is often problematic if layouts are missing.
+            # But we just fixed sv_shader_sources.py to remove layouts.
+            
+            # Let's try sticking to gpu.types.GPUShader but catch the error and try CreateInfo 
+            # if it fails, OR simply rely on the fixed source.
+            
+            # The user reported "cannot create 'GPUShader' instances" even after the fix?
+            # If so, maybe the inputs are still wrong.
+            
+            # Alternative: Construct CreateInfo properly.
+            shader_info = gpu.types.GPUShaderCreateInfo()
+            shader_info.push_constant('MAT4', "u_mvp")
+            shader_info.push_constant('VEC2', "u_resolution")
+            shader_info.push_constant('FLOAT', "u_dashSize")
+            shader_info.push_constant('FLOAT', "u_gapSize")
+            shader_info.push_constant('VEC4', "m_color")
+            
+            shader_info.vertex_in(0, 'VEC3', "inPos")
+            
+            iface = gpu.types.GPUStageInterfaceInfo("my_interface")
+            iface.flat('VEC3', "startPos")
+            iface.smooth('VEC3', "vertPos")
+            shader_info.vertex_out(iface)
+            
+            shader_info.fragment_out(0, 'VEC4', "fragColor")
+            
+            shader_info.vertex_source('''
+                void main()
+                {
+                    vec4 pos    = u_mvp * vec4(inPos, 1.0);
+                    gl_Position = pos;
+                    vertPos     = pos.xyz / pos.w;
+                    startPos    = vertPos;
+                }
+            ''')
+            
+            shader_info.fragment_source('''
+                void main()
+                {
+                    vec2  dir  = (vertPos.xy-startPos.xy) * u_resolution/2.0;
+                    float dist = length(dir);
+
+                    if (fract(dist / (u_dashSize + u_gapSize)) > u_dashSize/(u_dashSize + u_gapSize))
+                        discard; 
+                    fragColor = m_color;
+                }
+            ''')
+            config.dashed_shader = gpu.shader.create_from_info(shader_info)
+            return
+        except Exception as e:
+            print(f"Failed to create dashed shader via CreateInfo: {e}")
+            pass
+
     config.dashed_shader = gpu.types.GPUShader(dashed_vertex_shader, dashed_fragment_shader)
 
 
@@ -795,7 +870,7 @@ class SvViewerDrawMk4(SverchCustomTreeNode, bpy.types.Node):
         update=updateNode, name='Display Edges', default=True)
 
     polygon_color: FloatVectorProperty(
-        update=updateNode, name='Ploygons Color', default=(0.14, 0.54, 0.81, 1.0),
+        update=updateNode, name='Ploygons Color', default=(0.14, 0.54, 0.81, 0.2),
         size=4, min=0.0, max=1.0, subtype='COLOR')
 
     display_faces: BoolProperty(
@@ -811,7 +886,7 @@ class SvViewerDrawMk4(SverchCustomTreeNode, bpy.types.Node):
     use_dashed: BoolProperty(name='Dashes Edges', update=updateNode)
     u_dash_size: FloatProperty(default=0.12, min=0.0001, name="dash size", update=updateNode)
     u_gap_size: FloatProperty(default=0.19, min=0.0001, name="gap size", update=updateNode)
-    u_resolution: FloatVectorProperty(default=(25.0, 18.0), size=2, min=0.01, name="resolution", update=updateNode)
+    u_resolution: FloatVectorProperty(default=(20.0, 10.0), size=2, min=0.01, name="resolution", update=updateNode)
 
     # custom shader props
     def populate_node_with_custom_shader_from_text(self):
@@ -1080,11 +1155,7 @@ class SvViewerDrawMk4(SverchCustomTreeNode, bpy.types.Node):
             if not total_verts:
                 raise LookupError("Empty vertices list")
             edges = inputs['Edges'].sv_get(deepcopy=False, default=[[]])
-            if len(edges)==0:
-                edges=[[]]
             polygons = inputs['Polygons'].sv_get(deepcopy=False, default=[[]])
-            if len(polygons)==0:
-                polygons=[[]]
             matrix = inputs['Matrix'].sv_get(deepcopy=False, default=[[]])
             vector_color = inputs['Vector Color'].sv_get(deepcopy=False, default=[[self.vector_color]])
             edge_color = inputs['Edge Color'].sv_get(deepcopy=False, default=[[self.edge_color]])
@@ -1103,9 +1174,8 @@ class SvViewerDrawMk4(SverchCustomTreeNode, bpy.types.Node):
             config.polygons = polygons
             config.matrix = matrix
             config.face_culling_set = self.face_culling_set
-            if not inputs['Edges'].is_linked and self.display_edges or (not edges or len(edges)==1 and len(edges[0])==0):
-                if polygons and (not edges or len(edges)==1 and len(edges[0])==0):
-                    config.edges = polygons_to_edges_np(polygons, unique_edges=True)
+            if not inputs['Edges'].is_linked and self.display_edges:
+                config.edges = polygons_to_edges_np(polygons, unique_edges=True)
 
             geom = generate_mesh_geom(config, vecs)
 
